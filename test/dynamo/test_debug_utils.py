@@ -280,7 +280,7 @@ instantiate_device_type_tests(
 
 instantiate_device_type_tests(TestDebugUtils, globals())
 
-instantiate_device_type_tests(TestDebugUtilsDevice, globals(), except_for="mps")
+instantiate_device_type_tests(TestDebugUtilsDevice, globals(), allow_xpu=True, except_for="mps")
 
 
 class TestBackendOverrideIntegration(TestCase):
