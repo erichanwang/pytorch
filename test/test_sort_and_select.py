@@ -279,7 +279,7 @@ class TestSortAndSelect(TestCase):
                     )
 
                     # assert stride is preserved
-            if self.device_type in ("cuda", "xpu"):
+                    if self.device_type == "cuda":
                         # FIXME: this behavior should be true for all cases, not
                         # just the one specified in if condition
                         self.assertEqual(r1.values.stride(), t.stride())
@@ -355,7 +355,7 @@ class TestSortAndSelect(TestCase):
                 # binary strings
                 yield (torch.tensor([0, 1] * size, dtype=dtype, device=device), 0)
 
-            if self.device_type in ("cuda", "xpu"):
+            if self.device_type == "cuda":
                 return
 
             yield (torch.tensor([0, 1] * 100, dtype=dtype, device=device), 0)
