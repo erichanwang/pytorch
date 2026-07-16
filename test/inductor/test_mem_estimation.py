@@ -17,7 +17,7 @@ from torch.testing._internal.inductor_utils import GPU_TYPE, HAS_GPU
 from torch.utils._python_dispatch import TorchDispatchMode
 from torch.utils._pytree import tree_map_only
 from torch.utils.weak import WeakIdKeyDictionary
-
+from torch.testing._internal.common_device_type import instantiate_device_type_tests
 
 def tensor_storage_id(tensor):
     return tensor._typed_storage()._cdata
@@ -340,6 +340,8 @@ class TestMemoryTracker(InductorTestCase):
                 peak1, peak2, "Different scheduling produces different peak memory"
             )
 
+instantiate_device_type_tests(TestMemoryProfilingResNet, globals())
+instantiate_device_type_tests(TestMemoryTracker, globals())
 
 if __name__ == "__main__":
     if HAS_GPU:
