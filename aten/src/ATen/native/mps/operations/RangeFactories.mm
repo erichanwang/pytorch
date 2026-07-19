@@ -7,6 +7,8 @@
 #include <ATen/native/mps/OperationUtils.h>
 #include <ATen/ops/arange_native.h>
 #include <ATen/ops/linspace_native.h>
+#include <ATen/ops/logspace_native.h>
+#include <ATen/ops/pow.h>
 #include <ATen/ops/range_native.h>
 #include <array>
 #include <cmath>
@@ -205,6 +207,23 @@ Tensor& linspace_out_mps(const Scalar& start, const Scalar& end, int64_t steps, 
       }
     });
   }
+  return result;
+}
+
+Tensor& logspace_out_mps(const Scalar& start, const Scalar& end, int64_t steps, double base, Tensor& result) {
+  TORCH_CHECK(steps >= 0, "number of steps must be non-negative");
+  if (result.numel() != steps) {
+    result.resize_({steps});
+  }
+  if (steps == 0) {
+    return result;
+  } else if (steps == 1) {
+    result.fill_(std::pow(base, start.to<double>()));
+    return result;
+  }
+  // Fill result with the linear ramp [start, end], then exponentiate.
+  linspace_out_mps(start, end, steps, result);
+  result.copy_(at::pow(base, result)); // in-place base ** x, elementwise
   return result;
 }
 

@@ -15509,7 +15509,7 @@ class TestConsistency(TestCaseMPS):
         'nn.functional.interpolate',
         'nn.functional.upsample_nearest',
         'norm', 'masked.normalize',
-        'arange', 'linspace',
+        'arange', 'linspace', 'logspace',
         'special.xlog1py',
 
         # CPU accumulates sequantially, but GPU does in parallel
@@ -15598,7 +15598,7 @@ class TestConsistency(TestCaseMPS):
             # See https://github.com/pytorch/pytorch/issues/120237
             return (3e-5, 3e-5)
         # TODO: Rounding is broken for linspace, see https://github.com/pytorch/pytorch/issues/137635
-        if op.name == 'linspace' and dtype in [torch.int8, torch.uint8, torch.int32, torch.int16, torch.int64]:
+        if op.name in ['linspace', 'logspace'] and dtype in [torch.int8, torch.uint8, torch.int32, torch.int16, torch.int64]:
             return (1.0, 0.0)
         if op.name == "index_reduce" and op.variant_test_name in ['mean', 'prod'] and dtype in [torch.float16, torch.bfloat16]:
             return (0.01, 0.01)
