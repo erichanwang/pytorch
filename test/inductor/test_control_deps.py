@@ -7,16 +7,17 @@ from torch._inductor import config
 from torch._inductor.test_case import run_tests, TestCase as InductorTestCase
 from torch._inductor.utils import run_and_get_code
 from torch.testing import FileCheck
+from torch.testing._internal.common_device_type import instantiate_device_type_tests
 from torch.testing._internal.common_utils import IS_LINUX
 from torch.testing._internal.inductor_utils import (
     GPU_TYPE,
-    HAS_CUDA_AND_TRITON,
+    HAS_TRITON,
     HAS_GPU_AND_TRITON,
     requires_gpu,
 )
 
 
-requires_cuda_triton = unittest.skipUnless(HAS_CUDA_AND_TRITON, "requires CUDA")
+requires_accel_triton = unittest.skipUnless(torch.accelerator.is_available() and HAS_TRITON, "requires accelerator")
 
 
 class TestControlDeps(InductorTestCase):
@@ -652,7 +653,7 @@ class TestControlDeps(InductorTestCase):
                 "OrderingBarrier is_no_op() must be True",
             )
 
-    @requires_cuda_triton
+    @requires_accel_triton
     def test_bidirectional_stream_sync_correctness(self):
         """Regression: passthrough OrderingBarrier must be ordered after all subgraph ops.
 
@@ -665,29 +666,31 @@ class TestControlDeps(InductorTestCase):
         from torch._inductor.utils import run_and_get_code
 
         def fn(x):
-            s1 = torch.cuda.Stream()
-            s2 = torch.cuda.Stream()
-            event_s1 = torch.cuda.Event()
-            event_s2 = torch.cuda.Event()
-            with torch.cuda.stream(s1):
+            s1 = torch.accelerator.Stream()
+            s2 = torch.accelerator.Stream()
+            event_s1 = torch.accelerator.Event()
+            event_s2 = torch.accelerator.Event()
+            with torch.accelerator.stream(s1):
                 a = x * 2
                 event_s1.record(s1)
-            with torch.cuda.stream(s2):
+            with torch.accelerator.stream(s2):
                 event_s1.wait(s2)
                 b = a + 1
                 event_s2.record(s2)
-            with torch.cuda.stream(s1):
+            with torch.accelerator.stream(s1):
                 event_s2.wait(s1)
                 c = b * 2
             s1.synchronize()
             s2.synchronize()
             return c
 
-        x = torch.randn(1024, device="cuda")
+        x = torch.randn(1024, device=GPU_TYPE)
         expected = fn(x)
         result, _ = run_and_get_code(torch.compile(fn), x)
         self.assertEqual(result, expected)
 
+
+instantiate_device_type_tests(TestControlDeps, globals())
 
 if __name__ == "__main__":
     if IS_LINUX and HAS_GPU_AND_TRITON:
