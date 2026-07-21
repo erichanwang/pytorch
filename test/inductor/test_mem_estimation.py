@@ -19,6 +19,7 @@ from torch.utils._pytree import tree_map_only
 from torch.utils.weak import WeakIdKeyDictionary
 from torch.testing._internal.common_device_type import instantiate_device_type_tests
 
+
 def tensor_storage_id(tensor):
     return tensor._typed_storage()._cdata
 
