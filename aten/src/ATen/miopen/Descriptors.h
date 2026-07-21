@@ -152,11 +152,18 @@ struct TORCH_CUDA_CPP_API ConvolutionDescriptor
     MIOPEN_CHECK(miopenInitConvolutionNdDescriptor(mut_desc(), dim, pad, stride, upscale, c_mode));
     MIOPEN_CHECK(miopenSetConvolutionGroupCount(mut_desc(), groups));
     MIOPEN_CHECK(miopenSetConvolutionAttribute(mut_desc(), MIOPEN_CONVOLUTION_ATTRIB_DETERMINISTIC, deterministic ? 1 : 0));
+#if defined(ROCM_VERSION) && ROCM_VERSION >= 71300
     // TF32 is an fp32 compute mode: miopenMathDefault uses TF32 when possible,
     // miopenMathPedantic keeps strict IEEE fp32. Only meaningful for fp32 input.
+    // Gated to ROCm >= 7.13; on older ROCm the attribute is left at MIOpen's
+    // default (miopenMathPedantic), so TF32 conv is never enabled.
     if (dataType == miopenFloat) {
       MIOPEN_CHECK(miopenSetConvolutionAttribute(mut_desc(), MIOPEN_CONVOLUTION_ATTRIB_MATH_TYPE, allow_tf32 ? miopenMathDefault : miopenMathPedantic));
     }
+#else
+    // On ROCm < 7.13 allow_tf32 is unused; suppress -Wunused-parameter.
+    (void)allow_tf32;
+#endif
     if (benchmark) {
       MIOPEN_CHECK(miopenSetConvolutionFindMode(mut_desc(), miopenConvolutionFindModeNormal));
     }
