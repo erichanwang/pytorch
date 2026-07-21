@@ -39,6 +39,7 @@ __all__ = [
     "saved_tensors_hooks",
     "save_on_cpu",
     "disable_saved_tensors_hooks",
+    "node_creation_hook",
     "register_multi_grad_hook",
     "allow_mutation_on_saved_tensors",
     "Node",
@@ -454,6 +455,78 @@ def disable_saved_tensors_hooks(error_message: str) -> Generator[None, None, Non
             torch._C._autograd._saved_tensors_hooks_enable()
         else:
             torch._C._autograd._saved_tensors_hooks_disable(maybe_prev_message)
+
+
+class node_creation_hook:
+    """Context-manager that registers a hook called on each autograd Node created within it.
+
+    In that context, ``hook`` is called once for every autograd graph node
+    created by operations on tensors that require grad, with the freshly
+    created :class:`torch.autograd.graph.Node` as its only argument. The
+    intended use is to record the node, stash entries in ``node.metadata``,
+    or register backward hooks on it via
+    :meth:`~torch.autograd.graph.Node.register_hook` and
+    :meth:`~torch.autograd.graph.Node.register_prehook`.
+
+    The node is passed to the hook only once it is fully populated: its
+    ``next_functions`` are wired, all outputs' metadata are bound, and the
+    tensors saved for backward (``_saved_*``) have been stored, so a hook
+    that inspects the node sees its complete state.
+
+    The hook should have the following signature::
+
+        hook(node: torch.autograd.graph.Node) -> None
+
+    The registration is thread-local. It is captured into
+    :class:`~torch.autograd.graph.saved_tensors_hooks`-style thread-local
+    state, so it propagates to any worker thread that autograd (or another
+    subsystem built on it) spins up: if backward is run under this context
+    (or graph nodes are created during backward, e.g. with
+    ``create_graph=True`` or inside checkpoint recomputation), the hook also
+    fires for those nodes.
+
+    Nodes created by hooks themselves do not trigger hooks again. When
+    nesting this context-manager, all active hooks are called for each node,
+    outermost first.
+
+    One motivating use case is attributing work done during backward to the
+    forward region that created the graph, by capturing state at node
+    creation time and restoring it around the node's backward execution::
+
+        >>> # xdoctest: +SKIP
+        >>> def creation_hook(node):
+        ...     # ``current_region()``/``enter_region()`` are user-defined and
+        ...     # stand in for whatever thread-local state you want to restore
+        ...     # while this node runs in backward.
+        ...     region = current_region()
+        ...     node.register_prehook(lambda gO: enter_region(region))
+        ...     node.register_hook(lambda gI, gO: enter_region(None))
+        >>>
+        >>> with torch.autograd.graph.node_creation_hook(creation_hook):
+        ...     loss = model(inputs)
+
+    Example::
+
+        >>> a = torch.ones(5, requires_grad=True)
+        >>> with torch.autograd.graph.node_creation_hook(lambda node: print(node)):
+        ...     b = a * 2
+        <MulBackward0 object at ...>
+
+    .. note::
+        Hooks fire only for nodes attached to output tensors during the
+        context. In particular, gradient accumulation nodes for leaf tensors
+        (``AccumulateGrad``) are created lazily at their first use in
+        backward and do not trigger hooks.
+    """
+
+    def __init__(self, hook: Callable[[Node], None]) -> None:
+        self.hook = hook
+
+    def __enter__(self) -> None:
+        torch._C._autograd._push_node_creation_hook(self.hook)
+
+    def __exit__(self, *args: object) -> None:
+        torch._C._autograd._pop_node_creation_hook()
 
 
 def region_activation_memory_budget(

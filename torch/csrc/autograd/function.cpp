@@ -1,5 +1,7 @@
 #include <torch/csrc/autograd/function.h>
 
+#include <ATen/NodeCreationHooks.h>
+#include <c10/util/ScopeExit.h>
 #include <c10/util/ThreadLocal.h>
 #include <torch/csrc/autograd/engine.h>
 #include <torch/csrc/autograd/variable.h>
@@ -35,6 +37,30 @@ NodeGuard::~NodeGuard() {
 
 c10::intrusive_ptr<Node> get_current_node() {
   return current_evaluating_node;
+}
+
+void fire_node_creation_hooks(const c10::intrusive_ptr<Node>& node) {
+  const auto& state = at::impl::NodeCreationHooks::get_tls_state();
+  if (C10_LIKELY(state.stack.empty())) {
+    return;
+  }
+  if (state.is_firing) {
+    return;
+  }
+  // Every creation path fires a given node exactly once by construction;
+  // this asserts that invariant rather than deduping at runtime.
+  TORCH_INTERNAL_ASSERT(
+      !node->node_creation_hooks_fired(),
+      "node creation hooks fired twice for ",
+      node->name());
+  node->set_node_creation_hooks_fired();
+  at::impl::NodeCreationHooks::set_is_firing(true);
+  auto guard = c10::make_scope_exit(
+      [] { at::impl::NodeCreationHooks::set_is_firing(false); });
+  auto hooks = Engine::get_default_engine().get_node_creation_hooks();
+  for (const auto& hook : hooks) {
+    (*hook)(node);
+  }
 }
 
 void Node::assign_parent() {
