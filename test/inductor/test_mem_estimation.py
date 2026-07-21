@@ -341,8 +341,13 @@ class TestMemoryTracker(InductorTestCase):
                 peak1, peak2, "Different scheduling produces different peak memory"
             )
 
-instantiate_device_type_tests(TestMemoryProfilingResNet, globals(), except_for="cpu", allow_xpu=True)
-instantiate_device_type_tests(TestMemoryTracker, globals(), except_for="cpu", allow_xpu=True)
+
+instantiate_device_type_tests(
+    TestMemoryProfilingResNet, globals(), except_for="cpu", allow_xpu=True
+)
+instantiate_device_type_tests(
+    TestMemoryTracker, globals(), except_for="cpu", allow_xpu=True
+)
 
 if __name__ == "__main__":
     if HAS_GPU:
