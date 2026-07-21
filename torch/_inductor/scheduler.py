@@ -2347,6 +2347,13 @@ class SchedulerNode(BaseSchedulerNode):
         if self._loop_mutation_listener is not None:
             self._loop_mutation_listener(self)
 
+    def apply_indexing_exprs(self, replacements: dict[str, sympy.Expr]) -> None:
+        if self._body is None:
+            raise AssertionError("expected a loop body")
+        self._before_loop_state_mutation()
+        self._body = self._body.with_indexing_exprs(replacements)
+        self.refresh_dependencies(normalize=True, need_clear_tiling_cache=False)
+
     def apply_new_loop_order(self, new_order: Sequence[int]) -> None:
         self._before_loop_state_mutation()
         self._body = self._body.reorder_iter_loops(
@@ -7038,6 +7045,13 @@ class Scheduler:
 
         if any(n.is_cpu() for n in [node1, node2]):
             return -1
+        if not isinstance(node2, SchedulerNode):
+            return -1
+        if not isinstance(node2.node, ir.ComputedBuffer):
+            return -1
+        body = node2._body
+        if body is None:
+            return -1
 
         # Check for shared buffers between nodes
         node1_buffer_names = node1.read_writes.buffer_names()
@@ -7094,39 +7108,36 @@ class Scheduler:
             return -1
 
         # Verify we have exactly two indexing expressions (one read, one write)
-        if len(node2._body.indexing_exprs) != 2:  # type: ignore[attr-defined]
+        if len(body.indexing_exprs) != 2:
             return -1
 
         # No subblocks allowed for this optimization
-        if node2._body.subblocks:  # type: ignore[attr-defined]
+        if body.subblocks:
             return -1
 
-        if not (
-            "index0" in node2._body.indexing_exprs  # type: ignore[attr-defined]
-            and "index1" in node2._body.indexing_exprs  # type: ignore[attr-defined]
-        ):
+        if not ("index0" in body.indexing_exprs and "index1" in body.indexing_exprs):
             raise AssertionError("expected index0 and index1 in node2 indexing_exprs")
 
         # Extract and verify single read expression
-        node2_read_exprs = OrderedSet(expr for expr in node2._body.get_read_exprs())  # type: ignore[attr-defined]
+        node2_read_exprs = OrderedSet(body.get_read_exprs())
         if len(node2_read_exprs) != 1:
             return -1
 
         read_expr = next(iter(node2_read_exprs))
 
         # Determine which index is for reading vs writing
-        if read_expr == node2._body.indexing_exprs["index0"]:  # type: ignore[attr-defined]
+        if read_expr == body.indexing_exprs["index0"]:
             read_expr_index = "index0"
             write_expr_index = "index1"
         else:
-            if read_expr != node2._body.indexing_exprs["index1"]:  # type: ignore[attr-defined]
+            if read_expr != body.indexing_exprs["index1"]:
                 raise AssertionError("expected read_expr to match node2 index1 expr")
             read_expr_index = "index1"
             write_expr_index = "index0"
 
         from torch._inductor.invert_expr_analysis import generate_inverse_formula
 
-        index_vars = node2._body.vars[0]  # type: ignore[attr-defined]
+        index_vars = body.vars[0]
         if len(index_vars) != 1:
             return -1
 
@@ -7137,7 +7148,9 @@ class Scheduler:
             )
         simplified_read_expr = sum(simplified_terms)
 
-        inverse_formula = generate_inverse_formula(simplified_read_expr, index_vars[0])
+        inverse_formula = generate_inverse_formula(
+            simplified_read_expr, index_vars[0], node2_read.size[0]
+        )
 
         # formula is not invertible
         if inverse_formula is None:
@@ -7146,16 +7159,19 @@ class Scheduler:
         # === Apply Inversion ===
 
         # Swap the indexing expressions using the inverse formula
-        node2._body.indexing_exprs[read_expr_index] = node2._body.indexing_exprs[  # type: ignore[attr-defined]
-            write_expr_index
-        ]
-        node2._body.indexing_exprs[write_expr_index] = inverse_formula  # type: ignore[attr-defined]
+        node2.apply_indexing_exprs(
+            {
+                read_expr_index: body.indexing_exprs[write_expr_index],
+                write_expr_index: inverse_formula,
+            }
+        )
 
-        # Refresh dependencies and calculate fusion score
-        node2.refresh_dependencies(True, False)  # type: ignore[attr-defined]
+        # Calculate fusion score
         score = self.score_fusion_memory(node1, node2)
         if not isinstance(score, int):
             raise AssertionError("expected score to be an int")
+        if score == 0:
+            score = self._score_fusion_memory_by_fusable_read_write(node1, node2)
 
         fusion_log.info("Shared memory after inversion: %d", score)
         return score
