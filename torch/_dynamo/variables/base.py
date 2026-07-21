@@ -652,6 +652,15 @@ class VariableTracker(metaclass=VariableTrackerMeta):
         """
         return None
 
+    def call_getattribute(
+        self, tx: InstructionTranslatorBase, name: str
+    ) -> VariableTracker:
+        """Called for obj.__getattribute__(name).  The base delegates to
+        getattro_impl, which already implements GenericGetAttr without
+        __getattr__ fallback.  UDOV overrides to handle custom
+        __getattribute__ and to pass skip_getattr_fallback=True."""
+        return self.getattro_impl(tx, name)
+
     def getattro_impl(
         self, tx: InstructionTranslatorBase, name: str
     ) -> VariableTracker:
@@ -1026,25 +1035,26 @@ class VariableTracker(metaclass=VariableTrackerMeta):
             and args[0].is_python_constant()
             and not kwargs
         ):
-            # TODO(tp_getattro): In CPython, obj.__getattr__("foo") calls only
-            # the type's __getattr__ method, not the full attribute resolution.
-            # Currently we dispatch through getattro_impl which does the full
-            # GenericGetAttr + __getattr__ fallback. Fix in a follow-up to
-            # call __getattr__ directly for UDOV types.
-            return self.getattro_impl(tx, args[0].as_python_constant())
+            attr_name = args[0].as_python_constant()
+            result = self.call_getattr_fallback(tx, attr_name)
+            if result is not None:
+                return result
+            try:
+                type_name = self.python_type().__name__
+            except NotImplementedError:
+                type_name = type(self).__name__
+            raise_observed_exception(
+                AttributeError,
+                tx,
+                args=[f"'{type_name}' object has no attribute '__getattr__'"],
+            )
         elif (
             name == "__getattribute__"
             and len(args) == 1
             and args[0].is_python_constant()
             and not kwargs
         ):
-            # TODO(tp_getattro): In CPython, obj.__getattribute__("foo")
-            # calls GenericGetAttr WITHOUT the __getattr__ fallback.
-            # Currently we route through getattro_impl which, for UDOV,
-            # includes __getattr__. Fix in a follow-up to have UDOV
-            # override this to call generic_getattr (the inner helper)
-            # directly, skipping __getattr__.
-            return self.getattro_impl(tx, args[0].as_python_constant())
+            return self.call_getattribute(tx, args[0].as_python_constant())
         elif name == "__index__" and not args and not kwargs:
             return self.nb_index_impl(tx)
         elif name == "__int__" and not args and not kwargs:
