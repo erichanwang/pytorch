@@ -71,6 +71,7 @@ from torch.utils._sympy.functions import (
     Min,
     Mod,
 )
+from torch.utils._sympy.value_ranges import ValueRangeError
 
 
 aten = torch.ops.aten
@@ -793,6 +794,68 @@ def forward(self, x_1):
         _constrain_range_for_size(i3)
         self.assertTrue(expect_true(i2 * 4 == i3))
         self.assertExpectedInline(str(i3), """u3""")
+
+    def test_rename_unbacked_to_unifies_unbacked_dest(self):
+        shape_env = ShapeEnv()
+        orig = shape_env.create_unbacked_symint().node.expr
+        new = shape_env.create_unbacked_symint().node.expr
+        dest = shape_env.create_unbacked_symint().node.expr
+        shape_env._set_replacement(orig, dest, "test-setup")
+        shape_env._rename_unbacked_to(orig, new)
+        self.assertEqual(shape_env.replacements[orig], new)
+        self.assertEqual(shape_env.replacements[new], dest)
+
+    def test_rename_unbacked_to_raises_on_disjoint_ranges(self):
+        shape_env = ShapeEnv()
+        orig = shape_env.create_unbacked_symint()
+        new = shape_env.create_unbacked_symint()
+        dest = shape_env.create_unbacked_symint()
+        _constrain_range_for_size(dest, min=0, max=5)
+        _constrain_range_for_size(new, min=10, max=20)
+        shape_env._set_replacement(orig.node.expr, dest.node.expr, "test-setup")
+        with self.assertRaises(ValueRangeError):
+            shape_env._rename_unbacked_to(orig.node.expr, new.node.expr)
+
+    def test_rename_unbacked_to_preserves_backed_dest(self):
+        shape_env = ShapeEnv()
+        orig = shape_env.create_unbacked_symint().node.expr
+        new = shape_env.create_unbacked_symint().node.expr
+        dest = shape_env.create_unbacked_symint().node.expr
+        backed = create_symint(shape_env, 4).node.expr
+        shape_env._set_replacement(new, backed, "test-setup")
+        shape_env._set_replacement(orig, dest, "test-setup")
+        shape_env._rename_unbacked_to(orig, new)
+        self.assertEqual(shape_env.replacements[orig], new)
+        self.assertEqual(shape_env.replacements[new], backed)
+        self.assertEqual(shape_env.replacements[dest], backed)
+
+    def test_rename_unbacked_to_unifies_existing_unbacked(self):
+        shape_env = ShapeEnv()
+        orig = shape_env.create_unbacked_symint().node.expr
+        new = shape_env.create_unbacked_symint().node.expr
+        dest = shape_env.create_unbacked_symint().node.expr
+        other = shape_env.create_unbacked_symint().node.expr
+        shape_env._set_replacement(new, other, "test-setup")
+        shape_env._set_replacement(orig, dest, "test-setup")
+        shape_env._rename_unbacked_to(orig, new)
+        self.assertEqual(shape_env.replacements[orig], new)
+        self.assertEqual(shape_env.replacements[new], dest)
+        self.assertEqual(shape_env.replacements[other], dest)
+
+    def test_rename_unbacked_to_preserves_transitive_backed_dest(self):
+        shape_env = ShapeEnv()
+        orig = shape_env.create_unbacked_symint().node.expr
+        new = shape_env.create_unbacked_symint().node.expr
+        other = shape_env.create_unbacked_symint().node.expr
+        dest = shape_env.create_unbacked_symint().node.expr
+        backed = create_symint(shape_env, 4).node.expr
+        shape_env._set_replacement(other, backed, "test-setup")
+        shape_env._set_replacement(new, other, "test-setup")
+        shape_env._set_replacement(orig, dest, "test-setup")
+        shape_env._rename_unbacked_to(orig, new)
+        self.assertEqual(shape_env._find(new), backed)
+        self.assertEqual(shape_env.replacements[other], backed)
+        self.assertEqual(shape_env.replacements[dest], backed)
 
     def test_avoid_unbacked_substitution(self):
         shape_env = ShapeEnv()
