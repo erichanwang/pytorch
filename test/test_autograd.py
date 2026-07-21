@@ -16493,6 +16493,88 @@ class TestSelectiveActivationCheckpoint(TestCase):
         out.sum().backward()
 
     @skipIfTorchDynamo("compile tested in test/dynamo/test_activation_checkpointing.py")
+    def test_saved_tensors_hooks_fire_for_saved_tensors(self):
+        # Tensors SAC decides to save skip SavedVariable, so SAC must simulate
+        # pack/unpack with the surrounding user saved-tensors hooks.
+        def policy_fn(ctx, op, *args, **kwargs):
+            if op == torch.ops.aten.mm.default:
+                return CheckpointPolicy.MUST_SAVE
+            else:
+                return CheckpointPolicy.PREFER_RECOMPUTE
+
+        packed, unpacked = [], []
+
+        def pack(x):
+            packed.append(x)
+            return x * 2  # transform so we can tell unpack really ran
+
+        def unpack(x):
+            unpacked.append(x)
+            return x / 2
+
+        def fn(x):
+            return torch.mm(x, x).relu().sum()
+
+        context_fn = functools.partial(create_selective_checkpoint_contexts, policy_fn)
+        x = torch.randn(4, 4, requires_grad=True)
+
+        with torch.autograd.graph.saved_tensors_hooks(pack, unpack):
+            out = checkpoint(fn, x, use_reentrant=False, context_fn=context_fn)
+        out.backward()
+        # Exactly two packs, both during forward: the checkpoint input x
+        # (save_inputs) and the mm output (MUST_SAVE, via SAC storage).
+        # Recompute saves are shadowed by _recomputation_hook and don't fire.
+        self.assertEqual(len(packed), 2)
+        self.assertEqual(len(packed), len(unpacked))
+
+        x_ref = x.detach().clone().requires_grad_()
+        fn(x_ref).backward()
+        self.assertEqual(x.grad, x_ref.grad)
+
+        # Hooks around backward only must not affect tensors SAC saved
+        # without hooks in scope
+        packed.clear()
+        unpacked.clear()
+        x.grad = None
+        out = checkpoint(fn, x, use_reentrant=False, context_fn=context_fn)
+        with torch.autograd.graph.saved_tensors_hooks(pack, unpack):
+            out.backward()
+        self.assertEqual(len(packed), 0)
+        self.assertEqual(x.grad, x_ref.grad)
+
+    @skipIfTorchDynamo("gc is unreliable under dynamo-wrapped frames")
+    def test_saved_tensors_hooks_no_refcycle_with_stateful_owner(self):
+        # The graph retains checkpoint's internal pack_hook via SavedVariable
+        # in a way gc cannot traverse, so if pack_hook kept a permanent ref to
+        # the user hooks, a hook owner reaching back to the output would leak
+        # uncollectably. _user_hooks must not outlive the hooks TLS scope.
+        class Hooks:
+            def pack(self, t):
+                return t.detach()
+
+            def unpack(self, t):
+                return t
+
+        def scenario():
+            x = torch.randn(4, 4, requires_grad=True)
+            hooks = Hooks()
+
+            # No tensor args: keeps save_inputs from packing x through the
+            # user hooks, which would reach hooks via a pre-existing path.
+            def fn():
+                return torch.mm(x, x).relu().sum()
+
+            with torch.autograd.graph.saved_tensors_hooks(hooks.pack, hooks.unpack):
+                out = checkpoint(fn, use_reentrant=False)
+            hooks.output = out  # owner -> graph back-reference
+            return weakref.ref(hooks), weakref.ref(out)
+
+        hooks_ref, out_ref = scenario()
+        gc.collect()
+        self.assertIsNone(hooks_ref())
+        self.assertIsNone(out_ref())
+
+    @skipIfTorchDynamo("compile tested in test/dynamo/test_activation_checkpointing.py")
     def test_function_with_more_than_one_output(self):
         # maybe there is a more systematic way:
         counter = [0]
