@@ -1530,6 +1530,7 @@ class TestInductorOpInfo(TestCase):
                             )
                             adjusted_kwargs.update(
                                 check_gradient=requires_grad and has_grad_inputs,
+                                gradcheck_wrapper=op.gradcheck_wrapper,
                                 output_process_fn_grad=sample_input.output_process_fn_grad,
                             )
                         else:
