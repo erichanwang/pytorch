@@ -2221,9 +2221,7 @@ class SliceVariable(VariableTracker):
         self, tx: "InstructionTranslatorBase", name: str
     ) -> VariableTracker:
         if name in cmp_name_to_op_mapping or name in ("__hash__", "indices"):
-            return variables.GetAttrVariable(
-                self, name, py_type=type(getattr(slice, name))
-            )
+            return variables.CallMethodVariable(self, name)
         fields = ["start", "stop", "step"]
         if name not in fields:
             unimplemented(

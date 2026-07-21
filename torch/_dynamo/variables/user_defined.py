@@ -583,15 +583,17 @@ class UserDefinedClassVariable(UserDefinedVariable):
 
         # Step 6: Metaclass non-data descriptor or plain attr.
         # For C-level descriptors with proper VTs, invoke tp_descr_get to
-        # produce a bound method. For everything else, defer to GetAttrVariable
-        # which routes call_function through call_method at runtime.
+        # produce a bound method. Callable fallbacks get MTV (routes
+        # call_function through call_method); non-callable get VT.build.
         if meta_attr is not NO_SUCH_SUBOBJ:
             metacls_source = TypeSource(self.source) if self.source else None
             metacls_vt = VariableTracker.build(tx, type(self.value), metacls_source)
             result = _resolve_descriptor_get(tx, meta_attr, self, metacls_vt, source)
             if result is not None:
                 return result
-            return variables.GetAttrVariable(self, name, type(meta_attr), source=source)
+            if callable(meta_attr):
+                return variables.CallMethodVariable(self, name, source=source)
+            return VariableTracker.build(tx, meta_attr, source)
 
         # __getattr__ on metaclass (not part of type_getattro proper —
         # CPython handles this via slot_tp_getattr_hook).
@@ -646,11 +648,7 @@ class UserDefinedClassVariable(UserDefinedVariable):
         resolved = type.__getattribute__(self.value, name)
         if source:
             return VariableTracker.build(tx, resolved, source)
-        from . import ConstantVariable
-
-        if ConstantVariable.is_literal(resolved):
-            return VariableTracker.build(tx, resolved)
-        return variables.GetAttrVariable(self, name, type(resolved), source=source)
+        return VariableTracker.build(tx, resolved)
 
     def resolve_cls_descriptor(
         self,
@@ -728,9 +726,7 @@ class UserDefinedClassVariable(UserDefinedVariable):
         if name in cmp_name_to_op_mapping and not isinstance(
             cls_attr, types.FunctionType
         ):
-            return variables.GetAttrVariable(
-                self, name, py_type=type(cls_attr), source=source
-            )
+            return variables.CallMethodVariable(self, name, source=source)
 
         # wrapperdescr_get/method_get with obj=NULL returns the
         # descriptor itself.
@@ -784,7 +780,7 @@ class UserDefinedClassVariable(UserDefinedVariable):
                 )
             ):
                 return VariableTracker.build(tx, cls_attr, source)
-            return variables.GetAttrVariable(self, name, type(cls_attr), source=source)
+            return variables.CallMethodVariable(self, name, source=source)
 
         # Everything else: FunctionType, etc.
         return VariableTracker.build(tx, cls_attr, source)
@@ -800,9 +796,9 @@ class UserDefinedClassVariable(UserDefinedVariable):
         if name == "__new__" and UserDefinedClassVariable.is_supported_new_method(
             cls_attr
         ):
-            return variables.GetAttrVariable(self, name, source=source)
+            return variables.CallMethodVariable(self, name, source=source)
         if self.value is collections.OrderedDict:
-            return variables.GetAttrVariable(self, name, py_type=type(cls_attr))
+            return variables.CallMethodVariable(self, name)
         return VariableTracker.build(tx, cls_attr, source)
 
     def invoke_cls_descriptor_get(
@@ -1923,23 +1919,7 @@ class UserDefinedObjectVariable(UserDefinedVariable):
 
         source = self.source and self.get_source_by_walking_mro(tx, "__repr__")
         method_var = self.resolve_type_attr(tx, "__repr__", type_attr, source)
-        if not isinstance(method_var, variables.GetAttrVariable):
-            return method_var.call_function(tx, [], {})
-
-        try:
-            inspect.getattr_static(type(type_attr), "__get__")(
-                type_attr, self.value, type(self.value)
-            )
-        except (AttributeError, TypeError) as e:
-            raise_observed_exception(type(e), tx, args=list(e.args))
-        else:
-            unimplemented(
-                gb_type="untraceable user-defined __repr__",
-                context=f"Could not trace __repr__ override for {type(self.value).__name__}",
-                explanation="Dynamo could not safely trace this user-defined __repr__ override.",
-                hints=[*graph_break_hints.SUPPORTABLE],
-                skip_frame=True,
-            )
+        return method_var.call_function(tx, [], {})
 
     def str_impl(
         self,
@@ -1984,23 +1964,7 @@ class UserDefinedObjectVariable(UserDefinedVariable):
 
         source = self.source and self.get_source_by_walking_mro(tx, "__str__")
         method_var = self.resolve_type_attr(tx, "__str__", type_attr, source)
-        if not isinstance(method_var, variables.GetAttrVariable):
-            return method_var.call_function(tx, [], {})
-
-        try:
-            inspect.getattr_static(type(type_attr), "__get__")(
-                type_attr, self.value, type(self.value)
-            )
-        except (AttributeError, TypeError) as e:
-            raise_observed_exception(type(e), tx, args=list(e.args))
-        else:
-            unimplemented(
-                gb_type="untraceable user-defined __str__",
-                context=f"Could not trace __str__ override for {type(self.value).__name__}",
-                explanation="Dynamo could not safely trace this user-defined __str__ override.",
-                hints=[*graph_break_hints.SUPPORTABLE],
-                skip_frame=True,
-            )
+        return method_var.call_function(tx, [], {})
 
     def _call_method_var_or_const_fold(
         self,
@@ -2962,7 +2926,10 @@ class UserDefinedObjectVariable(UserDefinedVariable):
             method_var = self.resolve_type_attr(tx, "__len__", type_attr, source)
             if not isinstance(
                 method_var,
-                (variables.GetAttrVariable, variables.MethodWrapperVariable),
+                (
+                    variables.CallMethodVariable,
+                    variables.MethodWrapperVariable,
+                ),
             ):
                 return method_var.call_function(tx, [], {})
 
@@ -3743,7 +3710,7 @@ class UserDefinedObjectVariable(UserDefinedVariable):
             torch._C._dynamo.utils.is_instancemethod(type_attr)  # type: ignore[attr-defined]
             or is_cython_function(type_attr)
         ):
-            return variables.GetAttrVariable(self, name, type(type_attr), source=source)
+            return variables.CallMethodVariable(self, name, source=source)
 
         # Plain class variable (or MethodType, C-level non-data descriptor
         # without __get__, etc.).
@@ -4585,6 +4552,15 @@ class RemovableHandleVariable(VariableTracker):
         super().__init__(**kwargs)
         self.mutation_type = mutation_type
         self.idx = idx
+
+    def getattro_impl(
+        self, tx: "InstructionTranslatorBase", name: str
+    ) -> VariableTracker:
+        if name == "remove":
+            from .misc import CallMethodVariable
+
+            return CallMethodVariable(self, name)
+        return super().getattro_impl(tx, name)
 
     def call_method(
         self,

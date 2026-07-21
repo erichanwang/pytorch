@@ -92,7 +92,7 @@ from .dicts import (
 )
 from .hashable import is_hashable
 from .lists import BaseListVariable, ListVariable, TupleIteratorVariable, TupleVariable
-from .misc import NullVariable, StringFormatVariable
+from .misc import CallMethodVariable, NullVariable, StringFormatVariable
 from .object_protocol import (
     _NO_DEFAULT,
     binary_iop,
@@ -372,10 +372,13 @@ class BaseBuiltinVariable(VariableTracker):
                 ]
                 return variables.TupleVariable(items, source=source)
             return VariableTracker.build(tx, getattr(fn, name), source)
-        attr = getattr(fn, name, None)
-        return variables.GetAttrVariable(
-            self, name, py_type=type(attr) if attr is not None else None, source=source
-        )
+        try:
+            attr = getattr(fn, name)
+        except AttributeError:
+            raise_observed_exception(AttributeError, tx)
+        if callable(attr):
+            return CallMethodVariable(self, name, source=source)
+        return VariableTracker.build(tx, attr, source)
 
     def call_obj_hasattr(
         self, tx: "InstructionTranslatorBase", name: str
@@ -1019,16 +1022,12 @@ class BuiltinVariable(BaseBuiltinVariable):
     def tensor_args(self, *args: VariableTracker) -> bool:
         any_tensor = False
         for arg in args:
-            if isinstance(arg, variables.GetAttrVariable):
-                return False
             any_tensor = any_tensor or arg.is_tensor()
         return any_tensor
 
     def tensor_args_type(self, arg_types: list[type]) -> bool:
         any_tensor = False
         for arg_type in arg_types:
-            if issubclass(arg_type, variables.GetAttrVariable):
-                return False
             any_tensor = any_tensor or issubclass(arg_type, variables.TensorVariable)
         return any_tensor
 
@@ -2541,18 +2540,13 @@ class BuiltinVariable(BaseBuiltinVariable):
                 ]
                 return variables.TupleVariable(items, source=source)
             return VariableTracker.build(tx, getattr(self.fn, name), source)
-        if self.fn is object:
-            # for object, we can just directly read the attribute
-            try:
-                value = getattr(self.fn, name)
-            except AttributeError:
-                raise_observed_exception(AttributeError, tx)
-            if not callable(value):
-                return VariableTracker.build(tx, value, source)
-        attr = getattr(self.fn, name, None)
-        return variables.GetAttrVariable(
-            self, name, py_type=type(attr) if attr is not None else None, source=source
-        )
+        try:
+            attr = getattr(self.fn, name)
+        except AttributeError:
+            raise_observed_exception(AttributeError, tx)
+        if callable(attr):
+            return CallMethodVariable(self, name, source=source)
+        return VariableTracker.build(tx, attr, source)
 
     def call_delattr(
         self,
