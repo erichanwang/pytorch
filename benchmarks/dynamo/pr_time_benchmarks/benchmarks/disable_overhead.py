@@ -55,9 +55,31 @@ class Benchmark(_DisableOverheadBase):
         self._fn = torch._dynamo.disable(f)
 
 
+class BenchmarkDisableDynamo(_DisableOverheadBase):
+    # torch._compile._disable_dynamo is the torch-internal disable used on hot
+    # paths like torch.library.custom_op and torch.optim. It wraps fn in a
+    # functools.wraps closure that resolves and calls torch._dynamo.disable(fn)
+    # (the C DisableWrapper) on first use, so it inherits that fast path plus its
+    # own lazy-import wrapper frame.
+    _CATEGORY = "disable_dynamo_overhead"
+    _DESCRIPTION = "per-call overhead of torch._compile._disable_dynamo"
+
+    def _setup(self):
+        from torch._compile import _disable_dynamo
+
+        @_disable_dynamo
+        def f(x):
+            return x
+
+        self._fn = f
+
+
 def main():
     result_path = sys.argv[1]
     Benchmark().enable_instruction_count().collect_all().append_results(result_path)
+    BenchmarkDisableDynamo().enable_instruction_count().collect_all().append_results(
+        result_path
+    )
 
 
 if __name__ == "__main__":
