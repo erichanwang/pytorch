@@ -204,8 +204,94 @@ FLEX_GEMM_POINTWISE_OP_NAMES = frozenset(
         "clamp_max",
         "clamp_min",
         "convert_element_type",
+        "mx_e8m0_scale",
+        "nvfp4_e4m3_scale",
     )
 )
+
+
+def normalize_scale_rounding(op_name: str, rounding: Any) -> str:
+    """Resolve and validate a static scale-rounding argument."""
+    if op_name == "mx_e8m0_scale":
+        if rounding is None:
+            return "rceil"
+        if rounding not in ("floor", "rceil"):
+            raise NotImplementedError(
+                "FlexGEMM mx_e8m0_scale rounding must be 'floor', 'rceil', or None"
+            )
+        return rounding
+    if rounding is None:
+        return "nearest"
+    if rounding != "nearest":
+        raise NotImplementedError(
+            "FlexGEMM nvfp4_e4m3_scale rounding must be 'nearest' or None"
+        )
+    return rounding
+
+
+def _cute_scale_expr(
+    op_name: str,
+    source: Any,
+    max_value: float = 448.0,
+    rounding: str | None = None,
+    *,
+    tensorssa: bool = False,
+) -> str:
+    """Render scale encoders using their native CuTeDSL conversion paths."""
+    if op_name == "mx_e8m0_scale":
+        return f"mx_e8m0_scale_intrinsic({source}, {max_value!r}, {rounding!r})"
+    scale = f"({source} / 6.0)"
+    if tensorssa:
+        return (
+            f"cute.where({scale} < 0.015625, 0.015625, "
+            f"cute.where({scale} > 448.0, 448.0, {scale}))"
+        )
+    return f"cutlass.Float32(cutlass.max(cutlass.min({scale}, 448.0), 0.015625))"
+
+
+def _cute_scale_call(
+    op_name: str, args: tuple[Any, ...], kwargs: dict[str, Any]
+) -> Any:
+    """Lower FlexGEMM scale custom ops for TensorSSA values and scalar finalizers."""
+    if op_name == "mx_e8m0_scale":
+        if len(args) not in (1, 2, 3) or kwargs.keys() - OrderedSet(
+            ["max_value", "rounding"]
+        ):
+            raise NotImplementedError(f"unsupported FlexGEMM epilogue op: {op_name}")
+        max_value = args[1] if len(args) >= 2 else kwargs.get("max_value", 448.0)
+        rounding = args[2] if len(args) == 3 else kwargs.get("rounding")
+        if (
+            not isinstance(max_value, float)
+            or not math.isfinite(max_value)
+            or max_value <= 0
+        ):
+            raise NotImplementedError(
+                "FlexGEMM mx_e8m0_scale requires a static finite positive max_value"
+            )
+    else:
+        if len(args) not in (1, 2) or kwargs.keys() - OrderedSet(["rounding"]):
+            raise NotImplementedError(f"unsupported FlexGEMM epilogue op: {op_name}")
+        max_value = 448.0
+        rounding = args[1] if len(args) == 2 else kwargs.get("rounding")
+    rounding = normalize_scale_rounding(op_name, rounding)
+    source = args[0]
+    cse_var = CuteDSLOpOverrides._get_cse_var(source)
+    expr = _cute_scale_expr(
+        op_name,
+        source,
+        max_value,
+        rounding,
+        tensorssa=cse_var is not None,
+    )
+    if cse_var is None:
+        return expr
+    return V.kernel.cse.generate(
+        V.kernel.body,
+        expr,
+        bounds=cse_var.bounds,
+        dtype=cse_var.dtype,
+        shape=cse_var.shape,
+    )
 
 
 def _cute_arg(value: Any, env: dict[torch.fx.Node, Any]) -> Any:
@@ -226,6 +312,8 @@ def _cute_arg(value: Any, env: dict[torch.fx.Node, Any]) -> Any:
             int,
             float,
             bool,
+            str,
+            type(None),
             torch.dtype,
             torch.device,
             torch.layout,
@@ -268,6 +356,8 @@ def _cute_call(target: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) -> An
     op_name = _cute_op_name(target)
     if op_name is None:
         raise NotImplementedError(f"unsupported FlexGEMM epilogue op: {target}")
+    if op_name in ("mx_e8m0_scale", "nvfp4_e4m3_scale"):
+        return _cute_scale_call(op_name, args, kwargs)
     try:
         op = getattr(V.get_ops_handler(), op_name)
     except AttributeError:
