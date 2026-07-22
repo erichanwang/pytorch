@@ -11,6 +11,7 @@
 #include <ATen/native/PhiloxDistribution.h>
 #include <ATen/native/cuda/DistributionTemplates.h>
 #include <ATen/native/cuda/MemoryAccess.cuh>
+#include <ATen/OpMathType.h>
 #include <curand_kernel.h>
 #include <curand_philox4x32_x.h>
 #include <c10/util/irange.h>
@@ -37,6 +38,7 @@ using at::cuda::philox_4x32;
 // _PHILOX_DISTRIBUTION_* constants used by Python callers and Meta.
 enum class PhiloxDistributionKind : int64_t {
   Normal = 0,
+  Uniform = 1,
 };
 
 // Elements produced per Philox 4x32 call: 4 for float/half/bfloat16, 2 for double.
@@ -56,11 +58,29 @@ struct CurandNormalDouble2 {
   }
 };
 
+struct CurandUniformFloat4 {
+  __device__ float4 operator()(curandStatePhilox4_32_10_t* state) const {
+    return curand_uniform4(state);
+  }
+};
+
+struct CurandUniformDouble2 {
+  __device__ double2 operator()(curandStatePhilox4_32_10_t* state) const {
+    return curand_uniform2_double(state);
+  }
+};
+
 template <typename scalar_t>
 using CurandNormalSampler = std::conditional_t<
     std::is_same_v<scalar_t, double>,
     CurandNormalDouble2,
     CurandNormalFloat4>;
+
+template <typename scalar_t>
+using CurandUniformSampler = std::conditional_t<
+    std::is_same_v<scalar_t, double>,
+    CurandUniformDouble2,
+    CurandUniformFloat4>;
 
 // Box-Muller: convert 4 uniform uint32 values into 4 standard normal floats.
 __device__ __forceinline__ float4 box_muller_float(uint4 r) {
@@ -338,6 +358,31 @@ void validate_normal_std(double stddev) {
       stddev);
 }
 
+template <typename scalar_t>
+void validate_uniform_bounds(const Tensor& self, double low, double high) {
+  const auto min =
+      static_cast<double>(std::numeric_limits<scalar_t>::lowest());
+  const auto max = static_cast<double>(std::numeric_limits<scalar_t>::max());
+  TORCH_CHECK(low >= min && low <= max, "from is out of bounds for ", self.dtype());
+  TORCH_CHECK(
+      high >= min && high <= max, "to is out of bounds for ", self.dtype());
+  TORCH_CHECK(
+      low <= high,
+      "uniform_ expects to return a [from, to) range, but found from=",
+      low,
+      " > to=",
+      high);
+  TORCH_CHECK(
+      high - low <= max,
+      "uniform_ expects to-from <= std::numeric_limits<",
+      toString(self.scalar_type()),
+      ">::max(), but found to=",
+      high,
+      " and from=",
+      low,
+      " which result in to-from to exceed the limit");
+}
+
 // Single-key kernel: one thread per chunk of elements, where each chunk
 // comes from a single Philox 4x32 call. Uses vectorized stores for full
 // chunks and scalar writes for the tail.
@@ -611,7 +656,8 @@ Tensor& _philox_distribution_shards_symint_cuda_(
   const auto distribution_kind =
       static_cast<PhiloxDistributionKind>(distribution);
   TORCH_CHECK(
-      distribution_kind == PhiloxDistributionKind::Normal,
+      distribution_kind == PhiloxDistributionKind::Normal ||
+          distribution_kind == PhiloxDistributionKind::Uniform,
       "_philox_distribution_shards_: unsupported distribution kind ",
       distribution);
   TORCH_CHECK(
@@ -651,6 +697,34 @@ Tensor& _philox_distribution_shards_symint_cuda_(
                 chunk_count,
                 generator,
                 CurandNormalSampler<scalar_t>{},
+                param_func);
+          });
+      break;
+    case PhiloxDistributionKind::Uniform:
+      AT_DISPATCH_FLOATING_TYPES_AND2(
+          kHalf,
+          kBFloat16,
+          self.scalar_type(),
+          "_philox_distribution_shards_",
+          [&] {
+            validate_uniform_bounds<scalar_t>(self, param0, param1);
+            using opmath_t = at::opmath_type<scalar_t>;
+            auto lo = static_cast<scalar_t>(param0);
+            auto hi = static_cast<scalar_t>(param1);
+            auto range = static_cast<opmath_t>(hi - lo);
+            auto param_func = [range, lo, hi] __device__(opmath_t rand) {
+              auto value = static_cast<scalar_t>(rand * range + lo);
+              return value == hi ? lo : value;
+            };
+            distribution_shards<scalar_t>(
+                self,
+                global_shape_int,
+                global_offsets_int,
+                local_offsets_int,
+                local_sizes_int,
+                chunk_count,
+                generator,
+                CurandUniformSampler<scalar_t>{},
                 param_func);
           });
       break;
