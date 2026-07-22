@@ -1367,13 +1367,28 @@ test_inductor_torchbench_cpu_smoketest_perf(){
   mkdir -p "$TEST_REPORTS_DIR"
 
   test_inductor_set_cpu_affinity
-  MODELS_SPEEDUP_TARGET=benchmarks/dynamo/expected_ci_speedup_inductor_torchbench_cpu.csv
+  local models_perf_target=benchmarks/dynamo/expected_ci_speedup_inductor_torchbench_cpu.csv
+  local perf_metric=speedup
+  if [[ -n "${USE_ARC:-}" ]]; then
+    models_perf_target=benchmarks/dynamo/expected_ci_abs_latency_inductor_torchbench_cpu_osdc.csv
+    perf_metric=abs_latency
+  fi
 
-  grep -v '^ *#' < "$MODELS_SPEEDUP_TARGET" | while IFS=',' read -r -a model_cfg
+  if [[ ! -r "$models_perf_target" ]]; then
+    echo "Missing CPU TorchBench smoketest target file: $models_perf_target" >&2
+    return 1
+  fi
+  echo "Using CPU TorchBench smoketest $perf_metric targets from $models_perf_target"
+  local validation_status=0
+  while IFS=',' read -r -a model_cfg
   do
-    local model_name=${model_cfg[0]}
+    local model_name=${model_cfg[0]:-}
+    if [[ -z "$model_name" || "$model_name" == \#* ]]; then
+      continue
+    fi
     local data_type=${model_cfg[2]}
-    local speedup_target=${model_cfg[5]}
+    local perf_target=${model_cfg[5]}
+    local threshold_scale=${model_cfg[6]:-0.99}
     local backend=${model_cfg[1]}
     if [[ ${model_cfg[4]} == "cpp" ]]; then
       export TORCHINDUCTOR_CPP_WRAPPER=1
@@ -1393,9 +1408,14 @@ test_inductor_torchbench_cpu_smoketest_perf(){
     fi
     cat "$output_name"
     # The threshold value needs to be actively maintained to make this check useful.
-    # Allow 1% variance for CPU perf to accommodate perf fluctuation
-    python benchmarks/dynamo/check_perf_csv.py -f "$output_name" -t "$speedup_target" -s 0.99
-  done
+    # Allow 1% variance by default for CPU perf to accommodate perf fluctuation.
+    # Some models can override this in the target CSV when a tighter band is flaky.
+    # Fail on large improvements too so the baseline is updated promptly.
+    python benchmarks/dynamo/check_perf_csv.py -f "$output_name" -t "$perf_target" -s "$threshold_scale" \
+      --metric "$perf_metric" --fail-on-improvement \
+      || validation_status=$?
+  done < "$models_perf_target"
+  return "$validation_status"
 }
 
 test_torchbench_gcp_smoketest(){
