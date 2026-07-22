@@ -1568,7 +1568,11 @@ class TensorVariable(VariableTracker):
         *args: VariableTracker,
         **kwargs: VariableTracker,
     ) -> "DataPtrVariable":
-        return DataPtrVariable(self)
+        result = DataPtrVariable(self)
+        # Emit and cache the read here so later storage mutations cannot
+        # reorder it after the original data_ptr() call.
+        result.as_sym_node(tx)
+        return result
 
     def method_const_data_ptr(
         self,
@@ -3414,6 +3418,7 @@ class UntypedStorageVariable(VariableTracker):
                 (self.from_tensor.as_proxy(), args[0].as_proxy()),
                 {},
             )
+            DataPtrVariable.bump_storage_version(self.from_tensor.as_proxy().node)
             return self
 
         return super().call_method(tx, name, args, kwargs)
@@ -3425,6 +3430,7 @@ class UntypedStorageVariable(VariableTracker):
 
 
 class DataPtrVariable(VariableTracker):
+    _DATA_PTR_STORAGE_VERSION_KEY = "_dynamo_data_ptr_storage_version"
     _DATA_PTR_PRESERVING_TARGETS = {
         ("call_method", "detach"),
         ("call_function", torch.ops.aten.detach.default),
@@ -3440,9 +3446,27 @@ class DataPtrVariable(VariableTracker):
         self.from_tensor = from_tensor
         self.method_name = method_name
         self.tensor_version = from_tensor._get_fake_version()
+        self.storage_version = self.current_storage_version(from_tensor.as_proxy().node)
+        self._sym_node: VariableTracker | None = None
 
     def python_type(self) -> type:
         return int
+
+    def as_sym_node(self, tx: "InstructionTranslatorBase") -> VariableTracker:
+        if self.method_name != "data_ptr":
+            raise AssertionError(self.method_name)
+        if self._sym_node is not None:
+            return self._sym_node
+        from ..data_ptr_op import _data_ptr
+
+        proxy = tx.output.create_proxy(
+            "call_function",
+            _data_ptr,
+            (self.from_tensor.as_proxy(),),
+            {},
+        )
+        self._sym_node = SymNodeVariable.create(tx, proxy)
+        return self._sym_node
 
     @classmethod
     def _strip_data_ptr_preserving_aliases(cls, node: torch.fx.Node) -> torch.fx.Node:
@@ -3455,11 +3479,43 @@ class DataPtrVariable(VariableTracker):
             node = node.args[0]
         return node
 
+    @classmethod
+    def current_storage_version(cls, node: torch.fx.Node) -> int:
+        example_value = node.meta.get("example_value")
+        if isinstance(example_value, torch.Tensor):
+            # FakeTensor returns a stable storage wrapper for aliases, so this
+            # is the shared identity we can use to observe resize_ through views.
+            storage = example_value.untyped_storage()
+            return getattr(storage, cls._DATA_PTR_STORAGE_VERSION_KEY, 0)
+        root = cls._strip_data_ptr_preserving_aliases(node)
+        return root.meta.get(cls._DATA_PTR_STORAGE_VERSION_KEY, 0)
+
+    @classmethod
+    def bump_storage_version(cls, node: torch.fx.Node) -> None:
+        example_value = node.meta.get("example_value")
+        if isinstance(example_value, torch.Tensor):
+            # Store the epoch on the storage wrapper rather than node.meta so a
+            # resize_ through one alias invalidates data_ptr() equality for all
+            # aliases sharing the same fake storage.
+            storage = example_value.untyped_storage()
+            setattr(
+                storage,
+                cls._DATA_PTR_STORAGE_VERSION_KEY,
+                cls.current_storage_version(node) + 1,
+            )
+        else:
+            root = cls._strip_data_ptr_preserving_aliases(node)
+            root.meta[cls._DATA_PTR_STORAGE_VERSION_KEY] = (
+                cls.current_storage_version(root) + 1
+            )
+
     def _is_same_data_ptr(self, other: "VariableTracker") -> bool:
         if not isinstance(other, DataPtrVariable):
             return False
 
         if self.tensor_version is None or self.tensor_version != other.tensor_version:
+            return False
+        if self.storage_version != other.storage_version:
             return False
 
         self_root = self._strip_data_ptr_preserving_aliases(
@@ -3482,6 +3538,20 @@ class DataPtrVariable(VariableTracker):
         same_data_ptr = self._is_same_data_ptr(other)
         if same_data_ptr:
             return ConstantVariable.create(op == "__eq__")
+        if (
+            isinstance(other, DataPtrVariable)
+            and self.method_name == "data_ptr"
+            and other.method_name == "data_ptr"
+            and self.tensor_version is not None
+            and self.tensor_version == other.tensor_version
+            and self._strip_data_ptr_preserving_aliases(
+                self.from_tensor.as_proxy().node
+            )
+            is self._strip_data_ptr_preserving_aliases(
+                other.from_tensor.as_proxy().node
+            )
+        ):
+            return self.as_sym_node(tx).richcompare_impl(tx, other.as_sym_node(tx), op)
         unimplemented(
             gb_type="Data pointer comparison",
             context=f"richcompare_impl {self} {op} {other}",

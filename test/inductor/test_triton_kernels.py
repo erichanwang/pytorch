@@ -255,6 +255,212 @@ class KernelTests(torch._inductor.test_case.TestCase):
         # No need to assert anything, the goal is to make sure dynamo does
         # not crash
 
+    @skipIfWindows(msg="AOTI/Cpp_Wrapper have not enabled on Windows")
+    @requires_gpu
+    @inductor_config.patch("triton.autotune_at_compile_time", True)
+    @parametrize("cpp_wrapper", [False, True])
+    def test_data_ptr_packing(self, cpp_wrapper):
+        if cpp_wrapper and GPU_TYPE == "xpu":
+            self.skipTest("XPU cpp_wrapper data_ptr tracing is not supported yet")
+
+        @triton.jit
+        def add_kernel(xy, z, BLOCK_SIZE: "tl.constexpr", n_elements):
+            pid = tl.program_id(axis=0)
+            block_start = pid * BLOCK_SIZE
+            offsets = block_start + tl.arange(0, BLOCK_SIZE)
+            mask = offsets < n_elements
+            x_ptr = tl.load(xy + 0).to(tl.pointer_type(tl.float32))
+            y_ptr = tl.load(xy + 1).to(tl.pointer_type(tl.float32))
+            tmp_ptr = tl.load(xy + 2).to(tl.pointer_type(tl.float32))
+
+            x = tl.load(x_ptr + offsets, mask=mask)
+            y = tl.load(y_ptr + offsets, mask=mask)
+            tmp = tl.load(tmp_ptr + offsets, mask=mask)
+            tl.store(z + offsets, x + y + tmp, mask=mask)
+
+        @triton.jit
+        def mul2_kernel(x, z, BLOCK_SIZE: "tl.constexpr", n_elements):
+            pid = tl.program_id(axis=0)
+            block_start = pid * BLOCK_SIZE
+            offsets = block_start + tl.arange(0, BLOCK_SIZE)
+            mask = offsets < n_elements
+            tl.store(z + offsets, 2 * tl.load(x + offsets, mask=mask), mask=mask)
+
+        def f(x, y, block_size, use_offset_views):
+            tmp = x + y
+            if use_offset_views:
+                x_view = x[1:]
+                y_view = y[1:]
+                tmp_view = tmp[1:]
+            else:
+                x_view = x
+                y_view = y
+                tmp_view = tmp
+            xy = torch.tensor(
+                [x_view.data_ptr(), y_view.data_ptr(), tmp_view.data_ptr()],
+                dtype=torch.long,
+                pin_memory=True,
+            ).to(device=x.device, non_blocking=True)
+            z = torch.empty_like(x_view)
+            n_elements = x_view.numel()
+            grid = (triton.cdiv(n_elements, block_size),)
+            add_kernel[grid](xy, z, block_size, n_elements)
+            return z, xy
+
+        def f_unrelated_kernel_first(x, y):
+            doubled = torch.empty_like(x)
+            n_elements = x.numel()
+            grid = (triton.cdiv(n_elements, 4),)
+            mul2_kernel[grid](x, doubled, 4, n_elements)
+            tmp = doubled + y
+            xy = torch.tensor(
+                [x.data_ptr(), y.data_ptr(), tmp.data_ptr()],
+                dtype=torch.long,
+                pin_memory=True,
+            ).to(device=x.device, non_blocking=True)
+            z = torch.empty_like(x)
+            add_kernel[grid](xy, z, 4, n_elements)
+            return z
+
+        x = torch.randn(18, device=GPU_TYPE)
+        y = torch.randn(18, device=GPU_TYPE)
+        with inductor_config.patch(cpp_wrapper=cpp_wrapper):
+            compiled = torch.compile(f, fullgraph=True)
+            (actual, packed_ptrs), codes = run_and_get_code(compiled, x, y, 4, False)
+            torch.accelerator.synchronize()
+            self.assertEqual(actual, x + y + (x + y))
+            self.assertEqual(
+                packed_ptrs[:2].cpu(),
+                torch.tensor([x.data_ptr(), y.data_ptr()], dtype=torch.long),
+            )
+            self.assertNotEqual(packed_ptrs[2].item(), 0)
+            unaligned_x = torch.randn(19, device=GPU_TYPE)[1:]
+            unaligned_y = torch.randn(19, device=GPU_TYPE)[1:]
+            # Keep the unaligned runtime coverage for pointer identity and
+            # alignment-copy avoidance, but use scalar loads when dereferencing
+            # escaped raw pointers so the test does not depend on vector load
+            # behavior for unaligned addresses.
+            actual, packed_ptrs = compiled(unaligned_x, unaligned_y, 1, True)
+            torch.accelerator.synchronize()
+            self.assertEqual(
+                actual,
+                unaligned_x[1:] + unaligned_y[1:] + (unaligned_x + unaligned_y)[1:],
+            )
+            self.assertEqual(
+                packed_ptrs[:2].cpu(),
+                torch.tensor(
+                    [unaligned_x[1:].data_ptr(), unaligned_y[1:].data_ptr()],
+                    dtype=torch.long,
+                ),
+            )
+            self.assertNotEqual(packed_ptrs[2].item(), 0)
+            code = "\n".join(codes)
+            self.assertNotIn("Compile-time auto-tuning block:", code)
+            if not cpp_wrapper:
+                self.assertNotIn("copy_if_misaligned", code)
+                self.assertNotIn("assert_alignment(arg0_1", code)
+                self.assertNotIn("assert_alignment(arg1_1", code)
+                self.assertNotIn("del arg0_1", code)
+                self.assertNotIn("del arg1_1", code)
+                self.assertIn(".record_stream(torch.accelerator.current_stream(", code)
+                self.assertIn("_h2d_event_", code)
+                copy_idx = code.index(".copy_(")
+                copy_line = next(
+                    line for line in code.splitlines() if ".copy_(" in line
+                )
+                self.assertIn(", False)", copy_line)
+                h2d_stream_line = next(
+                    line
+                    for line in code.splitlines()
+                    if "_h2d_stream_" in line
+                    and " = torch.accelerator.current_stream(" in line
+                )
+                self.assertIn(".device)", h2d_stream_line)
+                h2d_stream_idx = code.index(h2d_stream_line)
+                h2d_sync_idx = code.index("_h2d_event_")
+                record_idx = code.index(".record(_h2d_stream_")
+                synchronize_idx = code.index(".synchronize()", record_idx)
+                launch_idx = code.index("add_kernel_0.run(")
+                self.assertGreater(h2d_stream_idx, copy_idx)
+                self.assertGreater(h2d_sync_idx, h2d_stream_idx)
+                self.assertGreater(record_idx, h2d_sync_idx)
+                self.assertGreater(synchronize_idx, record_idx)
+                self.assertLess(synchronize_idx, launch_idx)
+                launch_record_idx = code.index(
+                    ".record_stream(torch.accelerator.current_stream(", launch_idx
+                )
+                self.assertGreater(launch_record_idx, launch_idx)
+                marker = "torch.ops.prims._data_ptr.default("
+                for line in code.splitlines():
+                    if marker in line:
+                        source = line.split(marker, 1)[1].split(")", 1)[0]
+                        del_idx = code.find(f"del {source}")
+                        if del_idx != -1:
+                            self.assertGreater(del_idx, launch_idx)
+
+                if GPU_TYPE == "cuda":
+                    side_stream = torch.cuda.Stream()
+
+                    def f_stream(x, y):
+                        tmp = x + y
+                        xy = torch.tensor(
+                            [
+                                x.data_ptr(),
+                                y.data_ptr(),
+                                tmp.data_ptr(),
+                            ],
+                            dtype=torch.long,
+                            pin_memory=True,
+                        ).to(device=x.device, non_blocking=True)
+                        z = torch.empty_like(x)
+                        n_elements = x.numel()
+                        grid = (triton.cdiv(n_elements, 4),)
+                        side_stream.wait_stream(torch.cuda.current_stream())
+                        with torch.cuda.stream(side_stream):
+                            add_kernel[grid](xy, z, 4, n_elements)
+                        return z, xy
+
+                    expected = x + y + (x + y)
+                    compiled_stream = torch.compile(f_stream, fullgraph=True)
+                    (actual, _), stream_codes = run_and_get_code(compiled_stream, x, y)
+                    side_stream.synchronize()
+                    self.assertEqual(actual, expected)
+                    stream_code = "\n".join(stream_codes)
+                    self.assertIn("with stream1:", stream_code)
+                    stream_launch_idx = stream_code.index("add_kernel_0.run(")
+                    stream_record_idx = stream_code.index(
+                        ".record_stream(torch.accelerator.current_stream(",
+                        stream_launch_idx,
+                    )
+                    self.assertGreater(stream_record_idx, stream_launch_idx)
+                    stream_record_line = next(
+                        line
+                        for line in stream_code[stream_launch_idx:].splitlines()
+                        if ".record_stream(torch.accelerator.current_stream(" in line
+                    )
+                    self.assertTrue(stream_record_line.startswith("                "))
+
+                with inductor_config.patch(memory_planning=True):
+                    compiled_memory_planning = torch.compile(f, fullgraph=True)
+                    actual, packed_ptrs = compiled_memory_planning(x, y, 4, False)
+                    torch.accelerator.synchronize()
+                    self.assertEqual(actual, x + y + (x + y))
+                    self.assertNotEqual(actual.data_ptr(), packed_ptrs[2].item())
+
+                actual = torch.compile(f_unrelated_kernel_first, fullgraph=True)(x, y)
+                torch.accelerator.synchronize()
+                self.assertEqual(actual, x + y + (2 * x + y))
+            elif GPU_TYPE == "cuda":
+                self.assertIn("runTritonKernelWithAutotune(", code)
+                sync_fn = (
+                    "hipDeviceSynchronize" if torch.version.hip else "cuCtxSynchronize"
+                )
+                self.assertIn(sync_fn, code)
+                launch_idx = code.index("    call_add_kernel_0(")
+                sync_idx = code.index(sync_fn, launch_idx)
+                self.assertGreater(sync_idx, launch_idx)
+                self.assertIn("device_guard.set_index(", code[:sync_idx])
+
     @requires_gpu
     def test_triton_kernel_dunder_name_no_name_mangling(self):
         # Regression test for https://github.com/pytorch/pytorch/issues/170398
@@ -2519,16 +2725,24 @@ def forward(self, arg0_1, arg1_1):
         if backend == "inductor":
             log_stream, ctx = logs_to_string("torch._inductor.debug", "ir_post_fusion")
             with ctx():
-                compiled_out = torch.compile(
-                    f,
-                    fullgraph=True,
-                    backend=backend,
-                    dynamic=dynamic,
-                )(a, b)
+                compiled_out, codes = run_and_get_code(
+                    torch.compile(
+                        f,
+                        fullgraph=True,
+                        backend=backend,
+                        dynamic=dynamic,
+                    ),
+                    a,
+                    b,
+                )
 
             FileCheck().check("op4.unmet_dependencies").check(
                 "WeakDep(name='buf3', mutating_buf='buf4', is_fake=False)"
             ).run(log_stream.getvalue())
+            if tma_version == "old":
+                code = "\n".join(codes)
+                self.assertNotIn("torch.ops.prims._data_ptr.default", code)
+                self.assertNotIn("data_ptr() exposes", code)
         else:
             compiled_out = torch.compile(
                 f,
