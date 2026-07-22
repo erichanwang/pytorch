@@ -2988,7 +2988,9 @@ class TestSyncDecisionCrossRanks(MultiProcessTestCase):
                 valid_sizes = [
                     "torch.Size([16, 4])",
                     "torch.Size([2*s75, s75])",
+                    "torch.Size([2*s75, s96])",
                     "torch.Size([4*s75, s75])",
+                    "torch.Size([4*s75, s96])",
                 ]
                 if str(n.meta["val"].size()) not in valid_sizes:
                     raise AssertionError(
@@ -3112,6 +3114,8 @@ class TestSyncDecisionCrossRanks(MultiProcessTestCase):
                 valid_sizes = [
                     "torch.Size([(s75//2), s75])",
                     "torch.Size([(s75//4), s75])",
+                    "torch.Size([(s75//2), s96])",
+                    "torch.Size([(s75//4), s96])",
                 ]
                 if str(n.meta["val"].size()) not in valid_sizes:
                     raise AssertionError(
@@ -3230,7 +3234,7 @@ class TestSyncDecisionCrossRanks(MultiProcessTestCase):
         g = gm.graph
         for n in g.nodes:
             if is_all_reduce_tensor(n):
-                expected_size = "torch.Size([s75, s75])"
+                expected_size = "torch.Size([s75, s96])"
                 if str(n.meta["val"].size()) != expected_size:
                     raise AssertionError(
                         f"Expected size {expected_size}, got {n.meta['val'].size()}"
@@ -3361,7 +3365,7 @@ class TestSyncDecisionCrossRanks(MultiProcessTestCase):
         g = gm.graph
         for n in g.nodes:
             if is_all_to_all_tensor(n):
-                expected_size = "torch.Size([2*(((s75**2)//2)), s75])"
+                expected_size = "torch.Size([2*(((s75*s96)//2)), s96])"
                 if str(n.meta["val"].size()) != expected_size:
                     raise AssertionError(
                         f"Expected size {expected_size}, got {n.meta['val'].size()}"

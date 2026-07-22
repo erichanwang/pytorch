@@ -653,9 +653,9 @@ class AOTAutogradCacheTests(CacheKeyEquivalenceMixin, InductorTestCase):
         compiled_fn(a)
         compiled_fn(a8)
         compiled_fn(a16)
-        self.assertEqual(counters["aot_autograd"]["autograd_cache_miss"], 3)
-        self.assertEqual(counters["aot_autograd"]["autograd_cache_hit"], 0)
-        self.assertEqual(counters["aot_autograd"]["autograd_cache_saved"], 3)
+        self.assertEqual(counters["aot_autograd"]["autograd_cache_miss"], 2)
+        self.assertEqual(counters["aot_autograd"]["autograd_cache_hit"], 1)
+        self.assertEqual(counters["aot_autograd"]["autograd_cache_saved"], 2)
 
         self._clear_dynamo_and_codecache()
 
@@ -663,9 +663,9 @@ class AOTAutogradCacheTests(CacheKeyEquivalenceMixin, InductorTestCase):
         compiled_fn(a)
         compiled_fn(a8)
         compiled_fn(a16)
-        self.assertEqual(counters["aot_autograd"]["autograd_cache_miss"], 3)
-        self.assertEqual(counters["aot_autograd"]["autograd_cache_hit"], 3)
-        self.assertEqual(counters["aot_autograd"]["autograd_cache_saved"], 3)
+        self.assertEqual(counters["aot_autograd"]["autograd_cache_miss"], 2)
+        self.assertEqual(counters["aot_autograd"]["autograd_cache_hit"], 4)
+        self.assertEqual(counters["aot_autograd"]["autograd_cache_saved"], 2)
 
     @inductor_config.patch("fx_graph_remote_cache", False)
     @inductor_config.patch("fx_graph_cache", True)

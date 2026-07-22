@@ -5,7 +5,7 @@ from collections.abc import Callable, Sequence
 from contextlib import nullcontext
 from functools import lru_cache
 from itertools import chain
-from typing import cast
+from typing import cast, TypeVar
 
 import torch
 from torch._guards import detect_fake_mode
@@ -15,7 +15,11 @@ from torch._subclasses import FakeTensorMode
 from torch.distributed._functional_collectives import _are_we_tracing
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor._decompositions import DecompShardingStrategy
-from torch.distributed.tensor._dtensor_spec import DTensorSpec, TensorMeta
+from torch.distributed.tensor._dtensor_spec import (
+    _tensor_meta_has_symint,
+    DTensorSpec,
+    TensorMeta,
+)
 from torch.distributed.tensor._op_schema import (
     OpInfo,
     OpSchema,
@@ -43,6 +47,68 @@ from torch.utils._pytree import tree_map
 aten = torch.ops.aten
 
 log = logging.getLogger(__name__)
+
+
+_T = TypeVar("_T")
+
+
+def _object_contains_symbolic_tensor_meta(obj: object) -> bool:
+    if isinstance(obj, TensorMeta):
+        return _tensor_meta_has_symint(obj)
+    if isinstance(obj, DTensorSpec):
+        return obj.tensor_meta is not None and _tensor_meta_has_symint(obj.tensor_meta)
+    if isinstance(obj, OpSpec):
+        return _object_contains_symbolic_tensor_meta(
+            obj.output_specs
+        ) or _object_contains_symbolic_tensor_meta(obj.input_specs)
+    if isinstance(obj, OpStrategy):
+        return any(
+            _object_contains_symbolic_tensor_meta(strategy)
+            for strategy in obj.strategies
+        )
+    if isinstance(obj, TupleStrategy):
+        return any(
+            _object_contains_symbolic_tensor_meta(child) for child in obj.children
+        )
+    if isinstance(obj, dict):
+        return any(
+            _object_contains_symbolic_tensor_meta(value) for value in obj.values()
+        )
+    if isinstance(obj, (list, tuple)):
+        return any(_object_contains_symbolic_tensor_meta(value) for value in obj)
+    return False
+
+
+def _op_schema_can_be_cached(op_schema: OpSchema) -> bool:
+    # Symbol names are only meaningful within one ShapeEnv. Caching sharding
+    # propagation with symbolic TensorMeta would let unrelated ShapeEnvs that
+    # both contain a symbol named e.g. u0 share output metadata.
+    if _object_contains_symbolic_tensor_meta(
+        op_schema.args_schema
+    ) or _object_contains_symbolic_tensor_meta(op_schema.kwargs_schema):
+        return False
+    try:
+        hash(op_schema)
+    except TypeError:
+        return False
+    return True
+
+
+def _cached_or_uncached(
+    op_schema: OpSchema,
+    cached_fn: Callable[[OpSchema], _T],
+    uncached_fn: Callable[[OpSchema], _T],
+) -> _T:
+    if not _op_schema_can_be_cached(op_schema):
+        return uncached_fn(op_schema)
+    try:
+        return cached_fn(op_schema)
+    except TypeError:
+        # lru_cache hashes arguments before calling the wrapped function. If
+        # the schema is hashable, the TypeError came from the body and is real.
+        if _op_schema_can_be_cached(op_schema):
+            raise
+        return uncached_fn(op_schema)
 
 
 def _propagate_use_strided_shard_flag(
@@ -597,7 +663,11 @@ class ShardingPropagator:
         if _are_we_tracing():
             return self._propagate_tensor_meta_non_cached(op_schema)
         else:
-            return self._propagate_tensor_meta_cached(op_schema)
+            return _cached_or_uncached(
+                op_schema,
+                self._propagate_tensor_meta_cached,
+                self._propagate_tensor_meta_non_cached,
+            )
 
     def _create_output_spec_with_new_tensor_meta(
         self,
@@ -728,7 +798,12 @@ class ShardingPropagator:
             output_sharding = self.propagate_op_sharding_non_cached(op_info.schema)
         else:
             output_sharding = cast(
-                OutputSharding, self.propagate_op_sharding(op_info.schema)
+                OutputSharding,
+                _cached_or_uncached(
+                    op_info.schema,
+                    self.propagate_op_sharding,
+                    self.propagate_op_sharding_non_cached,
+                ),
             )
         op_info.output_sharding = output_sharding
 
