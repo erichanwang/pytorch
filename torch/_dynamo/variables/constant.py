@@ -111,6 +111,17 @@ class ConstantVariable(VariableTracker):
                     )
                 )
             return variables.BaseListVariable.cls_for(type(value))(items, **kwargs)
+        elif isinstance(value, bytearray):
+            items = []
+            for i, x in enumerate(value):
+                item_source = GetItemSource(source, i) if source else None
+                items.append(
+                    ConstantVariable.create(
+                        x,
+                        source=item_source,
+                    )
+                )
+            return variables.ByteArrayVariable(items, **kwargs)
 
         return ConstantVariable(value, **kwargs)
 

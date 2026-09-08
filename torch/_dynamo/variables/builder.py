@@ -964,6 +964,7 @@ class VariableBuilder:
                 (tuple, list, odict_values, collections.deque, torch.Size),
                 cls.wrap_listlike,
             ),
+            (bytearray, cls.wrap_bytearray),
             (itertools.count, cls.wrap_itertools_count),
             (tuple_iterator, cls.wrap_tuple_iterator),
             (range_iterator, cls.wrap_range_iterator),
@@ -2562,6 +2563,18 @@ class VariableBuilder:
         if istype(value, (list, collections.deque)):
             return self.tx.output.side_effects.track_mutable(value, result)
         return result
+
+    def wrap_bytearray(self, value: bytearray) -> VariableTracker:
+        self.install_guards(GuardBuilder.SEQUENCE_LENGTH)
+        items = [
+            VariableBuilder(
+                self.tx,
+                GetItemSource(self.source, i) if self.source else None,
+            )(x)
+            for i, x in enumerate(value)
+        ]
+        result = variables.ByteArrayVariable(items, source=self.source)
+        return self.tx.output.side_effects.track_mutable(value, result)
 
     def wrap_tuple_iterator(self, value: tuple_iterator) -> VariableTracker:
         self.install_guards(GuardBuilder.TUPLE_ITERATOR_LEN)

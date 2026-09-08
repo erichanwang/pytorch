@@ -17,6 +17,7 @@ allows Dynamo to accurately trace and optimize Python code while preserving its 
 """
 
 from .base import VariableTracker
+from .bytearray import ByteArrayVariable
 from .builtin import (
     BaseBuiltinVariable,
     BuiltinVariable,

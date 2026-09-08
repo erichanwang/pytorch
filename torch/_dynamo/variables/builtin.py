@@ -2453,6 +2453,48 @@ class BuiltinVariable(BaseBuiltinVariable):
         fs = FrozensetVariable(items, mutation_type=ValueMutationNew())
         return fs
 
+    def call_bytearray(
+        self,
+        tx: "InstructionTranslatorBase",
+        *args: VariableTracker,
+        **kwargs: VariableTracker,
+    ) -> VariableTracker:
+        if kwargs:
+            raise_type_error(
+                tx,
+                "bytearray() takes no keyword arguments",
+            )
+        if len(args) == 0:
+            return variables.ByteArrayVariable([], mutation_type=ValueMutationNew())
+        elif len(args) > 1:
+            raise_type_error(
+                tx,
+                f"bytearray expected at most 1 argument, got {len(args)}",
+            )
+        arg = args[0]
+        if arg.is_python_constant():
+            val = arg.as_python_constant()
+            if isinstance(val, int):
+                if val < 0:
+                    raise_observed_exception(ValueError, tx, args=["negative count"])
+                items = [ConstantVariable.create(0) for _ in range(val)]
+                return variables.ByteArrayVariable(items, mutation_type=ValueMutationNew())
+            elif isinstance(val, (bytes, bytearray)):
+                items = [ConstantVariable.create(x) for x in val]
+                return variables.ByteArrayVariable(items, mutation_type=ValueMutationNew())
+
+        unpacked = unpack_iterable(tx, arg)
+        items = []
+        for x in unpacked:
+            if x.is_python_constant():
+                v = x.as_python_constant()
+                if not isinstance(v, int) or not (0 <= v <= 255):
+                    raise_observed_exception(ValueError, tx, args=["byte must be in range(0, 256)"])
+                items.append(ConstantVariable.create(v))
+            else:
+                items.append(x)
+        return variables.ByteArrayVariable(items, mutation_type=ValueMutationNew())
+
     def call_zip(
         self,
         tx: "InstructionTranslatorBase",
