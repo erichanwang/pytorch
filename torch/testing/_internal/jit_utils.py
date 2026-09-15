@@ -1,7 +1,6 @@
 # mypy: ignore-errors
 
 # Torch
-from torch.autograd import Variable
 from torch.autograd.function import _nested_map
 from torch.jit.annotations import BroadcastingList2, BroadcastingList3  # noqa: F401
 
@@ -604,7 +603,7 @@ class JitTestCase(JitCommonTestCase):
             grads2 = torch.autograd.grad(l2, flattened_recording_inputs, allow_unused=allow_unused)
 
         if inputs_require_grads:
-            recording_inputs = do_input_map(lambda t: Variable(t, requires_grad=True), reference_tensors)
+            recording_inputs = do_input_map(lambda t: t.clone().requires_grad_(True), reference_tensors)
             flattened_recording_inputs = flatten_inputs(recording_inputs)
 
         outputs_ge = ge(*recording_inputs)
