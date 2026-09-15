@@ -829,7 +829,7 @@ def multilabelmarginloss_1d_no_reduce_test():
 
 
 def multilabelmarginloss_index_neg_test():
-    t = torch.clamp(torch.rand(5, 10).add(-0.5).mul(20).floor().long(), min=-1)
+    t = torch.clamp(torch.rand(5, 10).add(-.5).mul(20).floor().long(), min=-1)
     return dict(
         fullname='MultiLabelMarginLoss_index_neg',
         constructor=wrap_functional(
